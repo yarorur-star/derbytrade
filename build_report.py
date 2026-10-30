@@ -406,38 +406,26 @@ def sheet_group_structure(db, years):
 
 def sheet_country_structure(db, years):
     """Лист 6: товарная структура по ВСЕМ странам (без TOP-ограничений).
-
-    Структура листа (как в задании README):
-      - заголовок;
-      - «ВСЕГО ПО 10 ГРУППАМ» (итого, сумма) — 2 строки (К/С);
-      - 10 групп суммарно (итого по каждой из 10 позиций) — 2 строки на группу;
-      - данные по КАЖДОЙ стране: страна с итогом по стране (2 строки К/С)
-        + 10 групп по этой стране (2 строки на каждую позицию).
-    Порядок стран — по алфавиту названия. Названия стран и групп — as is из базы.
+    Две первые колонки: «Страна» и «Товарная группа FAO».
     """
     groups = group_list(db)
-    header = (["Страна / Товарная группа FAO", "Тип (К/С)"] +
+    header = (["Страна", "Товарная группа FAO", "Тип (К/С)"] +
               [f"Экспорт {y}" for y in years] + [f"Импорт {y}" for y in years])
 
-    # итоги по группам по миру (совпадают с листом 5)
     ge = {(r[0], r[2]): r for r in db.query(q_groups("E", years))[1]}
     gi = {(r[0], r[2]): r for r in db.query(q_groups("I", years))[1]}
     te = {(r[0], r[2]): r for r in db.query(q_groups_total("E", years))[1]}
     ti = {(r[0], r[2]): r for r in db.query(q_groups_total("I", years))[1]}
 
-    # справочник стран (NAME_EN as is)
     _, ref_c = db.query(f"SELECT UN_CODE, NAME_EN FROM {SCHEMA}.REF_COUNTRY_REPORTER")
     ref_names = dict(ref_c)
 
-    # данные «страна × группа × К/С» — БЕЗ фильтра по списку стран.
-    # Колонки with_country-запроса: 1=COUNTRY_CODE, 2=COUNTRY_NAME,
-    # 3=GROUP_CODE, 4=GROUP_NAME, 5=DATA_TYPE, 6..9=годы.
     ec = db.query(q_groups("E", years, with_country=True))[1]
     ic = db.query(q_groups("I", years, with_country=True))[1]
-    emap = {(r[0], r[2], r[4]): r for r in ec}   # (страна, группа, тип)
+    emap = {(r[0], r[2], r[4]): r for r in ec}
     imap = {(r[0], r[2], r[4]): r for r in ic}
     codes = sorted({r[0] for r in ec} | {r[0] for r in ic})
-    names = {}                                   # код -> название as is из базы
+    names = {}
     for r in ec + ic:
         if r[0] not in names or names[r[0]] is None:
             names[r[0]] = r[1]
@@ -458,36 +446,36 @@ def sheet_country_structure(db, years):
         return ev, iv
 
     rows = []
-    # всего по 10 группам (итого по миру)
+    # Всего по 10 группам (итого по миру)
     for dt_key in ("K", "C"):
         e = te.get(("TOTAL", dt_key)); i = ti.get(("TOTAL", dt_key))
         ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
         iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-        rows.append(["ВСЕГО ПО 10 ГРУППАМ", "К" if dt_key == "K" else "С"]
-                    + ev + iv)
-    # 10 групп суммарно (итого по каждой позиции)
+        rows.append(["ВСЕГО ПО 10 ГРУППАМ", "", "К" if dt_key == "K" else "С"] + ev + iv)
+
+    # Итоги по каждой из 10 групп
     for gcode, gname in groups:
         for dt_key in ("K", "C"):
             e = ge.get((gcode, dt_key)); i = gi.get((gcode, dt_key))
             ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
             iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-            rows.append([gname, "К" if dt_key == "K" else "С"] + ev + iv)
+            rows.append(["", gname, "К" if dt_key == "K" else "С"] + ev + iv)
 
     ordered_codes = sorted(codes, key=lambda c: (names[c], c))
     for code in ordered_codes:
         name = names[code]
-        # итог по стране: 2 строки (К/С)
+        # Итог по стране
         for dt_key in ("K", "C"):
             ev, iv = gsum(emap, imap, code, dt_key)
-            rows.append([name, "К" if dt_key == "K" else "С"] + ev + iv)
-        # 10 групп по стране: 2 строки на каждую группу
+            rows.append([name, "", "К" if dt_key == "K" else "С"] + ev + iv)
+        # Детализация: страна × группа
         for gcode, gname in groups:
             for dt_key in ("K", "C"):
                 e = emap.get((code, gcode, dt_key))
                 i = imap.get((code, gcode, dt_key))
                 ev = [fnum(x) for x in e[5:]] if e else [0.0] * len(years)
                 iv = [fnum(x) for x in i[5:]] if i else [0.0] * len(years)
-                rows.append([f"{name} {gname}",
+                rows.append([name, gname,
                              "К" if dt_key == "K" else "С"] + ev + iv)
     return header, rows
 
