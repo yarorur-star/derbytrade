@@ -278,41 +278,38 @@ CM_JOIN = (f"  JOIN {SCHEMA}.REF_COMMODITY cm\n"
            f"         ON m2.ID = r.PARENT_ID\n")
 
 
-def _group_part(kind, flow, years, country_filter=None, with_country=False):
-    """Одна часть UNION ALL: группировка по 10 группам FAO (или группа×страна)."""
+def _group_part(kind, flow, years, with_country=False):
+    """Одна часть UNION ALL: группировка по 10 группам FAO (или группа×страна).
+
+    with_country=True — Таблица 6: БЕЗ ограничений по странам, все страны,
+    присутствующие в факте (правило TOP-N относится только к таблицам 1–4).
+    """
     t, measure = VALUE_TABLES[kind]
     dtype = "C" if kind == "V" else "K"
     a = "t"
     sel = ",\n       ".join(f"SUM(COALESCE({a}.{vcol(y)}, 0)) AS Y{y}" for y in years)
-    cc = f"{a}.COUNTRY_REPORTER AS COUNTRY_CODE,\n       " if with_country else ""
+    cc = (f"{a}.COUNTRY_REPORTER AS COUNTRY_CODE,\n"
+          f"       MAX(c.NAME_EN) AS COUNTRY_NAME,\n       "
+          if with_country else "")
     gb = f"{a}.COUNTRY_REPORTER, " if with_country else ""
-    where_extra = ""
-    if country_filter:
-        ft, fm = country_filter
-        inner = (f"SELECT t2.COUNTRY_REPORTER\n"
-                 f"          FROM {SCHEMA}.{ft} t2\n"
-                 f"         WHERE t2.TRADE_FLOW = '{flow}'\n"
-                 f"           AND t2.MEASURE    = '{fm}'\n"
-                 f"         GROUP BY t2.COUNTRY_REPORTER\n"
-                 f"         ORDER BY SUM(COALESCE(t2.{vcol(years[-1])}, 0)) DESC,\n"
-                 f"                  t2.COUNTRY_REPORTER ASC\n"
-                 f"         FETCH FIRST {TOP_DEFAULT} ROWS ONLY")
-        where_extra = (f"\n   AND {a}.COUNTRY_REPORTER IN (\n        {inner})")
+    cj = (f"  LEFT JOIN {SCHEMA}.REF_COUNTRY_REPORTER c\n"
+          f"         ON c.UN_CODE = {a}.COUNTRY_REPORTER\n"
+          if with_country else "")
     return (f"SELECT {cc}m2.CODE AS GROUP_CODE,\n"
             f"       MAX(m2.NAME_EN) AS GROUP_NAME,\n"
             f"       '{dtype}' AS DATA_TYPE,\n"
             f"       {sel}\n"
-            f"  FROM {SCHEMA}.{t} {a}\n" + CM_JOIN.format(a=a) +
+            f"  FROM {SCHEMA}.{t} {a}\n" + cj + CM_JOIN.format(a=a) +
             f" WHERE {a}.TRADE_FLOW = '{flow}'\n"
-            f"   AND {a}.MEASURE    = '{measure}'{where_extra}\n"
+            f"   AND {a}.MEASURE    = '{measure}'\n"
             f" GROUP BY {gb}m2.CODE")
 
 
-def q_groups(flow, years, country_filter=None, with_country=False):
+def q_groups(flow, years, with_country=False):
     """Товарная структура по 10 группам: UNION стоимости (C) и веса (K)."""
-    parts = [_group_part("V", flow, years, country_filter, with_country),
-             _group_part("Q", flow, years, country_filter, with_country)]
-    order = "1, 2, 4" if with_country else "1, 3"
+    parts = [_group_part("V", flow, years, with_country),
+             _group_part("Q", flow, years, with_country)]
+    order = "1, 3, 5" if with_country else "1, 3"
     return "\nUNION ALL\n".join(parts) + f"\nORDER BY {order}"
 
 
@@ -358,8 +355,9 @@ def sheet_countries(db, years, top, kind, flow, unit_label, basis_kind):
 
     header = ["Страна"] + [f"{y} ({unit_label})" for y in years]
     rows = []
-    for rank, r in enumerate(top_rows, start=1):
-        rows.append([f"{rank}. {r[1]}"] + [fnum(x) for x in r[2:]])
+    # названия стран — as is из базы (NAME_EN), без нумерации и прочих правок
+    for r in top_rows:
+        rows.append([r[1]] + [fnum(x) for x in r[2:]])
     rows.append(["СУММА (ВСЕГО ЗА ГОД)"] + world)
     rows.append([f"СУММА {top} СТРАН-ЛИДЕРОВ"] + topsum)
     rows.append(["ПРОЧИЕ СТРАНЫ (ВСЕГО МИНУС ЛИДЕРЫ)"] + rest)
@@ -394,50 +392,78 @@ def sheet_group_structure(db, years):
         e = tot_e.get(("TOTAL", dt_key)); i = tot_i.get(("TOTAL", dt_key))
         ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
         iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-        rows.append(["ВСЕГО ПО 10 ГРУППАМ (ИТОГО)", "К" if dt_key == "K" else "С"]
+        rows.append(["ВСЕГО ПО 10 ГРУППАМ", "К" if dt_key == "K" else "С"]
                     + ev + iv)
     for gcode, gname in groups:
         for dt_key in ("K", "C"):
             e = exp.get((gcode, dt_key)); i = imp.get((gcode, dt_key))
             ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
             iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-            rows.append([f"{gcode}. {gname}", "К" if dt_key == "K" else "С"]
-                        + ev + iv)
+            # название группы — as is из базы (NAME_EN), без нумерации
+            rows.append([gname, "К" if dt_key == "K" else "С"] + ev + iv)
     return header, rows
 
 
-def sheet_country_structure(db, years, top):
-    """Лист 6: товарная структура по странам (топ-30 экспортёров и топ-30 импортёров)."""
+def sheet_country_structure(db, years):
+    """Лист 6: товарная структура по ВСЕМ странам (без TOP-ограничений).
+
+    Структура листа (как в задании README):
+      - заголовок;
+      - «ВСЕГО ПО 10 ГРУППАМ» (итого, сумма) — 2 строки (К/С);
+      - 10 групп суммарно (итого по каждой из 10 позиций) — 2 строки на группу;
+      - данные по КАЖДОЙ стране: страна с итогом по стране (2 строки К/С)
+        + 10 групп по этой стране (2 строки на каждую позицию).
+    Порядок стран — по алфавиту названия. Названия стран и групп — as is из базы.
+    """
     groups = group_list(db)
     header = (["Страна / Товарная группа FAO", "Тип (К/С)"] +
               [f"Экспорт {y}" for y in years] + [f"Импорт {y}" for y in years])
 
-    vt = VALUE_TABLES["V"]
-    # 1) итоги по каждой группе по миру (строки «10 групп суммарно»)
+    # итоги по группам по миру (совпадают с листом 5)
     ge = {(r[0], r[2]): r for r in db.query(q_groups("E", years))[1]}
     gi = {(r[0], r[2]): r for r in db.query(q_groups("I", years))[1]}
     te = {(r[0], r[2]): r for r in db.query(q_groups_total("E", years))[1]}
     ti = {(r[0], r[2]): r for r in db.query(q_groups_total("I", years))[1]}
 
-    # 2) списки стран: топ-30 экспортёров и топ-30 импортёров (по стоимости)
-    _, top_exp = db.query(q_top_subquery(vt, "E", years, top))
-    _, top_imp = db.query(q_top_subquery(vt, "I", years, top))
-    exp_codes = {r[0] for r in top_exp}
-    imp_codes = {r[0] for r in top_imp}
+    # справочник стран (NAME_EN as is)
+    _, ref_c = db.query(f"SELECT UN_CODE, NAME_EN FROM {SCHEMA}.REF_COUNTRY_REPORTER")
+    ref_names = dict(ref_c)
 
-    # 3) данные «страна × группа × К/С» для этих стран
-    ec = db.query(q_groups("E", years, country_filter=vt, with_country=True))[1]
-    ic = db.query(q_groups("I", years, country_filter=vt, with_country=True))[1]
-    emap = {(r[0], r[1], r[3]): r for r in ec}
-    imap = {(r[0], r[1], r[3]): r for r in ic}
+    # данные «страна × группа × К/С» — БЕЗ фильтра по списку стран.
+    # Колонки with_country-запроса: 1=COUNTRY_CODE, 2=COUNTRY_NAME,
+    # 3=GROUP_CODE, 4=GROUP_NAME, 5=DATA_TYPE, 6..9=годы.
+    ec = db.query(q_groups("E", years, with_country=True))[1]
+    ic = db.query(q_groups("I", years, with_country=True))[1]
+    emap = {(r[0], r[2], r[4]): r for r in ec}   # (страна, группа, тип)
+    imap = {(r[0], r[2], r[4]): r for r in ic}
+    codes = sorted({r[0] for r in ec} | {r[0] for r in ic})
+    names = {}                                   # код -> название as is из базы
+    for r in ec + ic:
+        if r[0] not in names or names[r[0]] is None:
+            names[r[0]] = r[1]
+    for code in codes:
+        if names.get(code) is None:
+            names[code] = ref_names.get(code, code)
+
+    def gsum(m1, m2, code, dt_key):
+        ev = [0.0] * len(years)
+        iv = [0.0] * len(years)
+        for gcode, _ in groups:
+            e = m1.get((code, gcode, dt_key))
+            i = m2.get((code, gcode, dt_key))
+            if e:
+                ev = [ev[k] + fnum(e[5 + k]) for k in range(len(years))]
+            if i:
+                iv = [iv[k] + fnum(i[5 + k]) for k in range(len(years))]
+        return ev, iv
 
     rows = []
-    # всего по 10 группам (итого)
+    # всего по 10 группам (итого по миру)
     for dt_key in ("K", "C"):
         e = te.get(("TOTAL", dt_key)); i = ti.get(("TOTAL", dt_key))
         ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
         iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-        rows.append(["ВСЕГО ПО 10 ГРУППАМ (ИТОГО)", "К" if dt_key == "K" else "С"]
+        rows.append(["ВСЕГО ПО 10 ГРУППАМ", "К" if dt_key == "K" else "С"]
                     + ev + iv)
     # 10 групп суммарно (итого по каждой позиции)
     for gcode, gname in groups:
@@ -445,39 +471,23 @@ def sheet_country_structure(db, years, top):
             e = ge.get((gcode, dt_key)); i = gi.get((gcode, dt_key))
             ev = [fnum(x) for x in e[3:]] if e else [0.0] * len(years)
             iv = [fnum(x) for x in i[3:]] if i else [0.0] * len(years)
-            rows.append([f"ИТОГО ГРУППА {gcode}. {gname}",
-                         "К" if dt_key == "K" else "С"] + ev + iv)
+            rows.append([gname, "К" if dt_key == "K" else "С"] + ev + iv)
 
-    ordered = ([r for r in top_exp] +
-               [r for r in top_imp if r[0] not in exp_codes])
-    for r in ordered:
-        code, name = r[0], r[1]
-        role = []
-        if code in exp_codes:
-            role.append("ЭКСПОРТ")
-        if code in imp_codes:
-            role.append("ИМПОРТ")
-        lbl_role = "/".join(role)
+    ordered_codes = sorted(codes, key=lambda c: (names[c], c))
+    for code in ordered_codes:
+        name = names[code]
         # итог по стране: 2 строки (К/С)
         for dt_key in ("K", "C"):
-            ev = [0.0] * len(years); iv = [0.0] * len(years)
-            for gcode, _ in groups:
-                e = emap.get((code, gcode, dt_key))
-                i = imap.get((code, gcode, dt_key))
-                if e:
-                    ev = [ev[k] + fnum(e[4 + k]) for k in range(len(years))]
-                if i:
-                    iv = [iv[k] + fnum(i[4 + k]) for k in range(len(years))]
-            rows.append([f"{name} [{lbl_role}]", "К" if dt_key == "K" else "С"]
-                        + ev + iv)
+            ev, iv = gsum(emap, imap, code, dt_key)
+            rows.append([name, "К" if dt_key == "K" else "С"] + ev + iv)
         # 10 групп по стране: 2 строки на каждую группу
         for gcode, gname in groups:
             for dt_key in ("K", "C"):
                 e = emap.get((code, gcode, dt_key))
                 i = imap.get((code, gcode, dt_key))
-                ev = [fnum(x) for x in e[4:]] if e else [0.0] * len(years)
-                iv = [fnum(x) for x in i[4:]] if i else [0.0] * len(years)
-                rows.append([f"    {name} → гр.{gcode} {gname}",
+                ev = [fnum(x) for x in e[5:]] if e else [0.0] * len(years)
+                iv = [fnum(x) for x in i[5:]] if i else [0.0] * len(years)
+                rows.append([f"{name} {gname}",
                              "К" if dt_key == "K" else "С"] + ev + iv)
     return header, rows
 
@@ -527,7 +537,8 @@ def main():
     ap.add_argument("--years", nargs="+", type=int, default=YEARS_DEFAULT,
                     help="4 последних года отчёта (по умолчанию 2021-2024)")
     ap.add_argument("--top", type=int, default=TOP_DEFAULT,
-                    help="число стран-лидеров (по умолчанию 30)")
+                    help="число стран-лидеров для таблиц 1–4 (по умолчанию 30; "
+                         "Таблица 6 формируется по всем странам без ограничений)")
     ap.add_argument("--rebuild", action="store_true",
                     help="пересоздать базу Derby из XLSX-дампов")
     args = ap.parse_args()
@@ -561,7 +572,8 @@ def main():
             h, rows = sheet_countries(db, years, top, kind, flow, unit, None)
             sheets[name] = (h, rows)
         sheets["Таблица_5"] = sheet_group_structure(db, years)
-        sheets["Таблица_6"] = sheet_country_structure(db, years, top)
+        # Таблица 6 — ВСЕ страны, без TOP-ограничений
+        sheets["Таблица_6"] = sheet_country_structure(db, years)
         write_excel(sheets)
     finally:
         db.close()
